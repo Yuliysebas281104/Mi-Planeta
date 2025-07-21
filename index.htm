@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Planet Ring</title>
+    <!-- Tailwind CSS CDN for basic styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Google Fonts for cursive text (Dancing Script) and Bodoni Moda (including light weight) -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Dancing+Script:wght@400;700&family=Bodoni+Moda:wght@300;400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden; /* Hide scrollbars */
+            font-family: 'Inter', sans-serif;
+            background-color: #000; /* Ensure black background */
+        }
+        canvas {
+            display: block;
+            width: 100vw; /* Full viewport width */
+            height: 100vh; /* Full viewport height */
+        }
+        .loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.9);
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-size: 2rem;
+            z-index: 1000;
+            flex-direction: column;
+            gap: 1rem;
+        }
+        /* Custom style for the cursive text */
+        .cursive-text {
+            font-family: 'Dancing Script', cursive;
+        }
+        /* Custom style for Bodoni Light text */
+        .font-bodoni {
+            font-family: 'Bodoni Moda', serif;
+            font-weight: 300; /* This sets the light weight for Bodoni */
+        }
+    </style>
+</head>
+<body>
+    <!-- Fixed text box at the top -->
+    <div class="absolute top-0 left-0 w-full p-4 text-center text-white text-4xl font-bold z-50">
+        <span class="font-bodoni">Mi Planeta Perfecto,</span>
+        <br>
+        <span class="cursive-text">Te Amo Mi Princesa Hermosa</span>
+    </div>
+
+    <div class="loading-overlay" id="loadingOverlay">
+        <p>Cargando planeta de mi niña... </p>
+        <div class="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-purple-500"></div>
+    </div>
+
+    <!-- Three.js CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- OrbitControls CDN for camera interaction -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <!-- FontLoader for TextGeometry -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/FontLoader.js"></script>
+    <!-- TextGeometry for creating 3D text -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/geometries/TextGeometry.js"></script>
+
+
+    <script type="module">
+        // --- Global Variables ---
+        let scene, camera, renderer, controls;
+        let planet, ringGroup, atmosphere; // Added atmosphere
+        let stars;
+        let comets = []; // Array to hold comet instances
+        const loadingOverlay = document.getElementById('loadingOverlay');
+        const clock = new THREE.Clock(); // Clock for time-based animations
+
+        // --- Atmosphere Shaders ---
+        const atmosphereVertexShader = `
+            varying vec3 vNormal;
+            varying vec3 vViewPosition;
+            void main() {
+                vNormal = normalize(normalMatrix * normal);
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                vViewPosition = -mvPosition.xyz;
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `;
+
+        const atmosphereFragmentShader = `
+            uniform vec3 atmosphereColor;
+            varying vec3 vNormal;
+            varying vec3 vViewPosition;
+            void main() {
+                // Calculate Fresnel effect for atmosphere glow
+                // The dot product of the normalized normal and view direction gives a value
+                // that is 1 when looking straight at the surface, and 0 when looking along the surface.
+                // 0.8 - dot(...) makes it brighter at the edges.
+                float intensity = pow(0.8 - dot(vNormal, normalize(vViewPosition)), 2.0);
+                gl_FragColor = vec4(atmosphereColor, 1.0) * intensity;
+            }
+        `;
+
+        // --- Star Shaders for Twinkling Effect ---
+        const starVertexShader = `
+            attribute float size;
+            attribute float brightness;
+            attribute float twinkleSpeed;
+            uniform float time;
+            varying float vBrightness;
+            void main() {
+                vBrightness = brightness;
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                // Apply twinkling effect to size based on time and twinkleSpeed
+                float twinkleFactor = 1.0 + sin(time * twinkleSpeed) * 0.5 * vBrightness;
+                gl_PointSize = size * (500.0 / -mvPosition.z) * twinkleFactor; // Increased multiplier for larger base size
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `;
+
+        const starFragmentShader = `
+            uniform sampler2D pointTexture;
+            varying float vBrightness;
+            void main() {
+                // Create a circular point
+                vec2 coord = gl_PointCoord - 0.5;
+                float dist = length(coord);
+                float alpha = 1.0 - dist * 2.0; // Fades out towards the edges
+
+                // Apply brightness and a slight random color tint
+                vec3 color = vec3(1.0, 1.0, 1.0) * vBrightness;
+                gl_FragColor = vec4(color, alpha); // Use alpha for fading
+            }
+        `;
+
+        // --- Shaders for Rounded Image Planes ---
+        const imageVertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `;
+
+        const imageFragmentShader = `
+            uniform sampler2D map;
+            uniform float borderRadiusWorldUnits; // Radius in world units
+            uniform vec2 planeHalfSizeWorldUnits; // Half dimensions of the plane in world units (width/2, height/2)
+            varying vec2 vUv;
+
+            // Signed Distance Function for a Rounded Rectangle
+            float sdRoundedRect(vec2 p, vec2 b, float r) {
+                vec2 q = abs(p) - b + r;
+                return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+            }
+
+            void main() {
+                vec4 texColor = texture2D(map, vUv);
+
+                // Convert UVs (0-1) to local coordinates of the plane (-planeHalfSize to +planeHalfSize)
+                // This ensures 'p_local' is in the same world units as 'borderRadiusWorldUnits'
+                vec2 p_local = (vUv - 0.5) * (planeHalfSizeWorldUnits * 2.0);
+
+                // Calculate signed distance to the rounded rectangle
+                // The 'b' parameter for sdRoundedRect should be the rectangle's half-dimensions *before* rounding
+                // So, it's planeHalfSizeWorldUnits minus the radius.
+                float d = sdRoundedRect(p_local, planeHalfSizeWorldUnits - borderRadiusWorldUnits, borderRadiusWorldUnits);
+
+                // Use smoothstep for anti-aliased edges
+                // fwidth(d) computes the absolute value of the partial derivatives of d
+                // This makes the smoothstep transition width adapt to screen resolution, for consistent anti-aliasing.
+                float alpha = 1.0 - smoothstep(-fwidth(d), fwidth(d), d);
+
+                gl_FragColor = vec4(texColor.rgb, texColor.a * alpha);
+
+                // Discard fragments that are almost fully transparent for performance
+                if (gl_FragColor.a < 0.001) discard;
+            }
+        `;
+
+        // --- Comet Class ---
+        class Comet {
+            constructor(scene) {
+                this.scene = scene;
+                this.group = new THREE.Group();
+
+                // Comet Head
+                const headGeometry = new THREE.SphereGeometry(2, 16, 16);
+                const headMaterial = new THREE.MeshBasicMaterial({ color: 0xADD8E6, transparent: true, blending: THREE.AdditiveBlending }); // Light blue, glowing
+                this.head = new THREE.Mesh(headGeometry, headMaterial);
+                this.head.castShadow = false; // Ensure no shadows
+                this.head.receiveShadow = false; // Ensure no shadows
+                this.group.add(this.head);
+
+                // Comet Tail (Sprite)
+                const tailTexture = new THREE.TextureLoader().load('https://threejs.org/examples/textures/sprites/spark1.png'); // A soft circular texture
+                const tailMaterial = new THREE.SpriteMaterial({
+                    map: tailTexture,
+                    color: 0xADD8E6, // Match head color
+                    transparent: true,
+                    blending: THREE.AdditiveBlending,
+                    opacity: 0.7
+                });
+                this.tail = new THREE.Sprite(tailMaterial);
+                this.tail.scale.set(30, 5, 1); // Stretched for tail effect
+                this.tail.position.set(-15, 0, 0); // Position behind the head relative to group
+                this.tail.castShadow = false; // Ensure no shadows
+                this.tail.receiveShadow = false; // Ensure no shadows
+                this.group.add(this.tail);
+
+                this.speed = 1.0 + Math.random() * 1.0; // Increased speed range (1.0 to 2.0)
+                this.direction = new THREE.Vector3();
+                this.resetPosition(); // Set initial random position and direction
+                scene.add(this.group);
+            }
+
+            resetPosition() {
+                // Randomly choose to enter from X or Y axis, far outside the view
+                const entrySide = Math.random() < 0.5 ? 'x' : 'y';
+                const range = 500; // A large range to ensure it starts off-screen
+
+                let startX, startY, startZ;
+                let targetX, targetY, targetZ;
+
+                if (entrySide === 'x') {
+                    startX = Math.random() < 0.5 ? -range : range; // Left or right
+                    startY = (Math.random() - 0.5) * range * 2;
+                    startZ = (Math.random() - 0.5) * range * 2;
+
+                    targetX = -startX; // Move to opposite side
+                    targetY = (Math.random() - 0.5) * range * 2;
+                    targetZ = (Math.random() - 0.5) * range * 2;
+                } else { // entrySide === 'y'
+                    startY = Math.random() < 0.5 ? -range : range; // Top or bottom
+                    startX = (Math.random() - 0.5) * range * 2;
+                    startZ = (Math.random() - 0.5) * range * 2;
+
+                    targetY = -startY; // Move to opposite side
+                    targetX = (Math.random() - 0.5) * range * 2;
+                    targetZ = (Math.random() - 0.5) * range * 2;
+                }
+
+                this.group.position.set(startX, startY, startZ);
+                this.direction.set(targetX - startX, targetY - startY, targetZ - startZ).normalize();
+
+                // Orient the comet to face its direction of travel
+                this.group.lookAt(this.group.position.clone().add(this.direction));
+                this.group.rotation.y += Math.PI / 2; // Adjust for sprite orientation
+            }
+
+            update() {
+                this.group.position.addScaledVector(this.direction, this.speed);
+
+                // Check if comet is far outside the initial range
+                const currentX = this.group.position.x;
+                const currentY = this.group.position.y;
+                const currentZ = this.group.position.z;
+                const resetThreshold = 600; // If it goes beyond this, reset
+
+                if (Math.abs(currentX) > resetThreshold || Math.abs(currentY) > resetThreshold || Math.abs(currentZ) > resetThreshold) {
+                    this.resetPosition();
+                }
+            }
+        }
+
+
+        // --- Initialization Function ---
+        function init() {
+            // Scene
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.0005); // Subtle fog for depth
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 0, 200);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            // Hide loading overlay once rendering starts
+            loadingOverlay.style.display = 'none';
+
+            // Controls (OrbitControls for interaction)
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true; // Smooth camera movement
+            controls.dampingFactor = 0.05;
+            controls.minDistance = 50; // Minimum zoom distance
+            controls.maxDistance = 500; // Maximum zoom distance
+            controls.autoRotate = true; // Enable auto-rotation
+            controls.autoRotateSpeed = 0.5; // Slow rotation speed
+
+            // --- Create Starry Background (Particles with Twinkling) ---
+            const starGeometry = new THREE.BufferGeometry();
+            const starVertices = [];
+            const starSizes = [];
+            const starBrightnesses = [];
+            const starTwinkleSpeeds = [];
+
+            const numStars = 20000; // Increased number of stars
+            for (let i = 0; i < numStars; i++) {
+                const x = THREE.MathUtils.randFloatSpread(2000); // Spread stars over a large area
+                const y = THREE.MathUtils.randFloatSpread(2000);
+                const z = THREE.MathUtils.randFloatSpread(2000);
+                starVertices.push(x, y, z);
+
+                starSizes.push(Math.random() * 2.0 + 1.0); // Increased base size (1.0 to 3.0)
+                starBrightnesses.push(Math.random() * 0.5 + 0.5); // Increased base brightness (0.5 to 1.0)
+                starTwinkleSpeeds.push(Math.random() * 2 + 0.5); // Varying twinkle speeds
+            }
+            starGeometry.setAttribute('position', new THREE.Float32BufferAttribute(starVertices, 3));
+            starGeometry.setAttribute('size', new THREE.Float32BufferAttribute(starSizes, 1));
+            starGeometry.setAttribute('brightness', new THREE.Float32BufferAttribute(starBrightnesses, 1));
+            starGeometry.setAttribute('twinkleSpeed', new THREE.Float32BufferAttribute(starTwinkleSpeeds, 1));
+
+            const starMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    time: { value: 0.0 },
+                    pointTexture: { value: new THREE.TextureLoader().load('https://threejs.org/examples/textures/sprites/disc.png') } // A simple circular texture
+                },
+                vertexShader: starVertexShader,
+                fragmentShader: starFragmentShader,
+                blending: THREE.AdditiveBlending, // For glowing effect
+                depthWrite: false, // Important for blending
+                transparent: true
+            });
+            stars = new THREE.Points(starGeometry, starMaterial);
+            scene.add(stars);
+
+            // --- Create Planet ---
+            const planetGeometry = new THREE.SphereGeometry(30, 64, 64); // Larger sphere for better detail
+            const textureLoader = new THREE.TextureLoader();
+
+            // Load a planet texture for the diffuse map
+            const planetTexture = textureLoader.load('https://threejs.org/examples/textures/planets/earth_atmos_2048.jpg');
+            // Optional: Load a normal map for more surface detail (uncomment if you have one)
+            // const planetNormalMap = textureLoader.load('https://threejs.org/examples/textures/planets/earth_normal_2048.jpg');
+
+            const planetMaterial = new THREE.MeshStandardMaterial({
+                map: planetTexture,
+                // normalMap: planetNormalMap, // Uncomment if using a normal map
+                roughness: 0.8, // Adjust for surface shininess
+                metalness: 0.1 // Adjust for metallic properties
+            });
+            planet = new THREE.Mesh(planetGeometry, planetMaterial);
+            scene.add(planet);
+
+            // --- Create Atmosphere ---
+            const atmosphereGeometry = new THREE.SphereGeometry(30.5, 64, 64); // Slightly larger than the planet
+            const atmosphereMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    atmosphereColor: { value: new THREE.Color(0xADD8E6) } // Light blue atmosphere color
+                },
+                vertexShader: atmosphereVertexShader,
+                fragmentShader: atmosphereFragmentShader,
+                side: THREE.BackSide, // Render from the inside of the sphere
+                blending: THREE.AdditiveBlending, // For glowing effect
+                transparent: true,
+                depthWrite: false // Important for transparent objects
+            });
+            atmosphere = new THREE.Mesh(atmosphereGeometry, atmosphereMaterial);
+            planet.add(atmosphere); // Add atmosphere as a child of the planet
+
+            // --- Create Planet Ring with Images (Random Orbit) ---
+            ringGroup = new THREE.Group(); // Group to hold all ring images
+            planet.add(ringGroup); // Add ring group as a child of the planet for combined rotation
+
+            // Rutas a tus imágenes locales en la carpeta 'img'
+            const imageURLs = [
+                "./img/imagen1.jpg",
+                "./img/imagen2.jpg",
+                "./img/imagen3.jpg",
+                "./img/imagen4.jpg",
+                "./img/imagen5.jpg",
+                "./img/imagen6.jpg",
+                "./img/imagen7.jpg",
+                "./img/imagen8.jpg",
+                "./img/imagen9.jpg",
+                "./img/imagen10.jpg",
+                "./img/imagen11.jpg",
+                "./img/imagen12.jpg",
+                "./img/imagen13.jpg",
+                "./img/imagen14.jpg",
+                "./img/imagen15.jpg",
+                "./img/imagen16.jpg",
+                "./img/imagen17.jpg",
+                "./img/imagen18.jpg",
+                "./img/imagen19.jpg",
+                "./img/imagen20.jpg",
+                "./img/imagen21.jpg",
+                "./img/imagen22.jpg",
+                "./img/imagen23.jpg",
+                "./img/imagen24.jpg",
+                "./img/imagen25.jpg",
+                "./img/imagen26.jpg",
+                "./img/imagen27.jpg",
+                "./img/imagen28.jpg",
+                "./img/imagen29.jpg",
+                "./img/imagen30.jpg"
+            ];
+
+
+            const minOrbitRadius = 60; // Minimum distance from planet center
+            const maxOrbitRadius = 150; // Maximum distance from planet center
+            const maxVerticalOffset = 30; // Maximum vertical dispersion
+            const baseImageSize = 25; // Base size for images (e.g., height)
+            const borderRadiusWorldUnits = 2.0; // Border radius in world units (adjust this value for more or less rounding)
+
+            imageURLs.forEach((url, index) => {
+                textureLoader.load(url,
+                    (texture) => {
+                        // Calculate the aspect ratio of the original image
+                        const aspectRatio = texture.image.width / texture.image.height;
+                        // Adjust the plane width to maintain the aspect ratio
+                        const planeWidth = baseImageSize * aspectRatio;
+                        const planeHeight = baseImageSize; // Height remains as base size
+
+                        // Re-integrating the ShaderMaterial for rounded border and aspect ratio correction
+                        const material = new THREE.ShaderMaterial({
+                            uniforms: {
+                                map: { value: texture },
+                                borderRadiusWorldUnits: { value: borderRadiusWorldUnits },
+                                planeHalfSizeWorldUnits: { value: new THREE.Vector2(planeWidth * 0.5, planeHeight * 0.5) }
+                            },
+                            vertexShader: imageVertexShader,
+                            fragmentShader: imageFragmentShader,
+                            transparent: true,
+                            side: THREE.DoubleSide,
+                            depthWrite: false, // Important for transparent objects
+                            blending: THREE.NormalBlending // Use NormalBlending for standard transparency
+                        });
+
+                        const geometry = new THREE.PlaneGeometry(planeWidth, planeHeight);
+                        const imageMesh = new THREE.Mesh(geometry, material);
+
+                        // Position images randomly around the planet
+                        const radius = minOrbitRadius + Math.random() * (maxOrbitRadius - minOrbitRadius);
+                        const angle = Math.random() * Math.PI * 2; // Completely random angle
+                        imageMesh.position.x = Math.cos(angle) * radius;
+                        imageMesh.position.z = Math.sin(angle) * radius;
+                        imageMesh.position.y = (Math.random() - 0.5) * maxVerticalOffset; // Random vertical offset
+
+                        // Store initial angle and radius for independent orbit
+                        imageMesh.userData.initialAngle = angle;
+                        imageMesh.userData.orbitRadius = radius;
+                        imageMesh.userData.orbitSpeed = 0.001 + Math.random() * 0.003; // Varying orbit speed
+
+                        // Make images always face the camera (billboard effect)
+                        imageMesh.lookAt(camera.position);
+
+                        ringGroup.add(imageMesh);
+                    },
+                    // onProgress callback
+                    (xhr) => {
+                        console.log((xhr.loaded / xhr.total * 100) + '% loaded for image: ' + url);
+                    },
+                    // onError callback
+                    (error) => {
+                        console.error('Error loading image:', url, error);
+                        // Fallback: create a simple colored plane if image fails to load
+                        const material = new THREE.MeshBasicMaterial({ color: 0x888888, side: THREE.DoubleSide });
+                        const geometry = new THREE.PlaneGeometry(baseImageSize, baseImageSize); // Fallback also square
+                        const imageMesh = new THREE.Mesh(geometry, material);
+                        const radius = minOrbitRadius + Math.random() * (maxOrbitRadius - minOrbitRadius);
+                        const angle = Math.random() * Math.PI * 2;
+                        imageMesh.position.x = Math.cos(angle) * radius;
+                        imageMesh.position.z = Math.sin(angle) * radius;
+                        imageMesh.position.y = (Math.random() - 0.5) * maxVerticalOffset;
+                        imageMesh.lookAt(camera.position);
+                        ringGroup.add(imageMesh);
+                    }
+                );
+            });
+
+            // --- Create Comets ---
+            const numComets = 5;
+            for (let i = 0; i < numComets; i++) {
+                comets.push(new Comet(scene));
+            }
+
+            // --- Lighting ---
+            // Ambient light provides general illumination, not directional shadows
+            const ambientLight = new THREE.AmbientLight(0x404040, 0.5); // Softer ambient light
+            scene.add(ambientLight);
+
+            // Directional light to simulate sunlight
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 2); // Brighter directional light
+            directionalLight.position.set(50, 50, 50).normalize(); // Position it to cast light from an angle
+            scene.add(directionalLight);
+
+            renderer.shadowMap.enabled = false; // Explicitly disable shadow map for performance
+
+            // --- Event Listeners ---
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        // --- Handle Window Resize ---
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Update controls
+            controls.update(); // This will handle auto-rotation if enabled
+
+            const elapsedTime = clock.getElapsedTime(); // Get elapsed time for animations
+
+            // Animate planet rotation
+            if (planet) {
+                planet.rotation.y += 0.001;
+                // No need to update shader uniforms for planet material if using MeshStandardMaterial
+            }
+
+            // Animate individual images in the ring
+            if (ringGroup) {
+                ringGroup.children.forEach(imageMesh => {
+                    // Update position based on its own orbit speed and radius
+                    imageMesh.userData.initialAngle += imageMesh.userData.orbitSpeed;
+                    imageMesh.position.x = Math.cos(imageMesh.userData.initialAngle) * imageMesh.userData.orbitRadius;
+                    imageMesh.position.z = Math.sin(imageMesh.userData.initialAngle) * imageMesh.userData.orbitRadius;
+
+                    // Make images always face the camera (billboard effect)
+                    imageMesh.lookAt(camera.position);
+                });
+            }
+
+            // Animate stars (subtle movement or twinkling)
+            if (stars) {
+                stars.rotation.y += 0.0001;
+                stars.rotation.x += 0.00005;
+                // Update star shader time uniform for twinkling
+                stars.material.uniforms.time.value = elapsedTime;
+            }
+
+            // Update comets
+            comets.forEach(comet => {
+                comet.update();
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        // Initialize and start animation when the window loads
+        window.onload = function() {
+            init();
+            animate();
+        };
+    </script>
+</body>
+</html>
